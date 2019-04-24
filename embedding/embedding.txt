@@ -1,0 +1,2 @@
+crawl-300d-2M.vec download from https://fasttext.cc/docs/en/english-vectors.html
+glove.6B.300d.txt download from https://nlp.stanford.edu/projects/glove/
