@@ -1,125 +1,132 @@
-import argparse
-
 from string import punctuation
-
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import torch
-import torch.nn as nn
-import torch.autograd as autograd
-import torch.optim as optim
-import torch.nn.functional as F
+import os
+from keras.models import Model
+from keras.layers import Input, Dense, Embedding, SpatialDropout1D, Dropout, add, concatenate
+from keras.layers import CuDNNLSTM, Bidirectional, GlobalMaxPooling1D, GlobalAveragePooling1D
+from keras.preprocessing import text, sequence
+from keras.callbacks import LearningRateScheduler
 
-# 2 words to the left, 2 to the right
-CONTEXT_SIZE = 2
-EMBEDDING_SIZE = 10
+os.environ["CUDA_VISIBLE_DEVICES"]="0,1"
 
+NUM_MODELS = 2
+BATCH_SIZE = 512
+LSTM_UNITS = 128
+DENSE_HIDDEN_UNITS = 4 * LSTM_UNITS
+EPOCHS = 4
+MAX_LEN = 220
 
-parser = argparse.ArgumentParser()
-parser.add_argument('-tr', '--train', action='store_true', help='Train model and generate CSV submission file')
-parser.add_argument('-te', '--test', action='store_true', help='Test model and generate CSV submission file')
-# luan xu
-
-def process_data():
-    df = pd.read_csv('./csv/train.csv', nrows=10)
-    comments = []
-    vocabs = []
-    for comment in df['comment_text']:
-        for c in punctuation:
-            comment = comment.replace(c, ' ') if c in comment else comment
-        vocab = comment.lower().split()
-        vocabs = vocab + vocabs
-        comments.append(vocab)
-    return df['target'], comments, vocabs
+EMBEDDING_FILES = [
+    'embedding/crawl-300d-2M.vec',
+    'embedding/glove.6B.300d.txt'
+]
 
 
-class CBOW(nn.Module):
-    def __init__(self, context_size=2, embedding_size=100, vocab_size=None):
-        super(CBOW, self).__init__()
-        self.embeddings = nn.Embedding(vocab_size, embedding_size)
-        self.linear1 = nn.Linear(embedding_size, vocab_size)
+def preprocess(data):
 
-    def forward(self, inputs):
-        lookup_embeds = self.embeddings(inputs)
-        embeds = lookup_embeds.sum(dim=0)
-        out = self.linear1(embeds)
-        return out
+    def clean_special_chars(text, punct):
+        for p in punctuation:
+            text = text.replace(p, ' ')
+        return text
+
+    data = data.astype(str).apply(lambda x: clean_special_chars(x, punctuation))
+    return data
 
 
-def make_context_vector(context, word_to_ix):
-    idxs = [word_to_ix[w] for w in context]
-    tensor = torch.LongTensor(idxs)
-    return autograd.Variable(tensor)
+def get_coefs(word, *arr):
+    return word, np.asarray(arr, dtype='float32')
 
 
-# Part of our loss function will be a penalty term.
-# Pearson Correlation requires us to calculate Covariance:
-def cov(m, y=None):
-    if y is not None:
-        m = torch.cat((m, y), dim=0)
-    m_exp = torch.mean(m, dim=1)
-    x = m - m_exp[:, None]
-    cov = 1 / (x.size(1) - 1) * x.mm(x.t())
-    return cov
+def load_embeddings(path):
+    with open(path, encoding='utf-8') as f:
+        return dict(get_coefs(*line.strip().split(' ')) for line in f)
+
+def build_model(embedding_matrix, num_aux_targets):
+    words = Input(shape=(MAX_LEN,))
+    x = Embedding(*embedding_matrix.shape, weights=[embedding_matrix], trainable=False)(words)
+    x = SpatialDropout1D(0.3)(x)
+    x = Bidirectional(CuDNNLSTM(LSTM_UNITS, return_sequences=True))(x)
+    x = Bidirectional(CuDNNLSTM(LSTM_UNITS, return_sequences=True))(x)
+
+    hidden = concatenate([
+        GlobalMaxPooling1D()(x),
+        GlobalAveragePooling1D()(x),
+    ])
+    hidden = add([hidden, Dense(DENSE_HIDDEN_UNITS, activation='relu')(hidden)])
+    hidden = add([hidden, Dense(DENSE_HIDDEN_UNITS, activation='relu')(hidden)])
+    result = Dense(1, activation='sigmoid')(hidden)
+    aux_result = Dense(num_aux_targets, activation='sigmoid')(hidden)
+
+    model = Model(inputs=words, outputs=[result, aux_result])
+    model.compile(loss='binary_crossentropy', optimizer='adam')
+
+    return model
 
 
-def pcor(m, y=None):
-    x = cov(m, y)
-
-    # Not interested in positive nor negative correlations;
-    # We're only interested in correlation magnitudes:
-    x = (x * x).sqrt()  # no negs
-
-    stddev = x.diag().sqrt()
-    x = x / stddev[:, None]
-    x = x / stddev[None, :]
-    return x
+def build_matrix(word_index, path):
+    embedding_index = load_embeddings(path)
+    embedding_matrix = np.zeros((len(word_index) + 1, 300))
+    for word, i in word_index.items():
+        try:
+            embedding_matrix[i] = embedding_index[word]
+        except KeyError:
+            pass
+    return embedding_matrix
 
 
-def pcor_err(m, y=None):
-    # Every var is correlated with itself, so subtract that:
-    x = (pcor(m, y) - torch.eye(m.size(0)))
-    return x.mean(dim=0).mean()
+def main():
+    print('start load data...')
+    train = pd.read_csv('./csv/train.csv')
+    test = pd.read_csv('./csv/test.csv')
+    print('find %d train dataset and %d test dataset' %(len(train), len(train)))
 
+    x_train = preprocess(train['comment_text'])
+    y_train = np.where(train['target'] >= 0.5, 1, 0)
+    y_aux_train = train[['target', 'severe_toxicity', 'obscene', 'identity_attack', 'insult', 'threat']]
+    x_test = preprocess(test['comment_text'])
+
+    tokenizer = text.Tokenizer()
+    tokenizer.fit_on_texts(list(x_train) + list(x_test))
+
+    x_train = tokenizer.texts_to_sequences(x_train)
+    x_test = tokenizer.texts_to_sequences(x_test)
+    x_train = sequence.pad_sequences(x_train, maxlen=MAX_LEN)
+    x_test = sequence.pad_sequences(x_test, maxlen=MAX_LEN)
+
+    print('load embedding...')
+    embedding_matrix = np.concatenate([build_matrix(tokenizer.word_index, f) for f in EMBEDDING_FILES], axis=-1)
+
+
+    checkpoint_predictions = []
+    weights = []
+
+    print('start train...')
+    for model_idx in range(NUM_MODELS):
+        model = build_model(embedding_matrix, y_aux_train.shape[-1])
+        for global_epoch in range(EPOCHS):
+            model.fit(
+                x_train,
+                [y_train, y_aux_train],
+                batch_size=BATCH_SIZE,
+                epochs=1,
+                verbose=2,
+                callbacks=[
+                    LearningRateScheduler(lambda epoch: 1e-3 * (0.6 ** global_epoch))
+                ]
+            )
+            checkpoint_predictions.append(model.predict(x_test, batch_size=2048)[0].flatten())
+            weights.append(2 ** global_epoch)
+
+    print('start predict...')
+    predictions = np.average(checkpoint_predictions, weights=weights, axis=0)
+
+    submission = pd.DataFrame.from_dict({
+        'id': test['id'],
+        'prediction': predictions
+    })
+
+    submission.to_csv('submission.csv', index=False)
 
 if __name__ == '__main__':
-    print('Process training data...')
-    values, comments, vocab = process_data()
-    vocab_size = len(vocab)
-    word_to_ix = {word: i for i, word in enumerate(vocab)}
-    data = []
-
-    for comment in comments:
-        for i in range(CONTEXT_SIZE, len(comment) - CONTEXT_SIZE):
-            context = [comment[i - 2], comment[i - 1],
-                       comment[i + 1], comment[i + 2]]
-            target = autograd.Variable(torch.LongTensor([word_to_ix[comment[i]]]))
-            data.append((context, target))
-            print(data)
-
-    loss_func = nn.CrossEntropyLoss()
-
-    net = CBOW(CONTEXT_SIZE, embedding_size=EMBEDDING_SIZE, vocab_size=vocab_size)
-    optimizer = optim.Adam(net.parameters())
-
-
-    for epoch in range(100):
-        total_loss = 0
-        for context, target in data:
-            context_var = make_context_vector(context, word_to_ix)
-            net.zero_grad()
-            probs = net(context_var)
-
-            loss = loss_func(probs.view(1, -1), target) + pcor_err(
-                torch.transpose(net.embeddings.weight, 0, 1)) * 6  # (vocab_size//2+1) ?
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.data
-        print(total_loss)
-    c = np.corrcoef(net.embeddings.weight.data.numpy().T)
-
-    print(type(net.embeddings.weight.data))
-    print(type(net.embeddings.weight))
-    print(type(net.embeddings))
+    main()
